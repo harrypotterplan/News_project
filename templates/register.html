@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>회원가입</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; }
+        .error { color: red; }
+        .success { color: green; }
+    </style>
+</head>
+<body>
+    <h2>회원가입</h2>
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+            {% for category, message in messages %}
+                <p class="{{ category }}">{{ message }}</p>
+            {% endfor %}
+        {% endif %}
+    {% endwith %}
+    <form method="POST">
+        <p>이메일: <input type="email" name="email" required></p>
+        <p>사용자 이름: <input type="text" name="username" required></p>
+        <p>비밀번호: <input type="password" name="password" required></p>
+        <p><input type="submit" value="가입하기"></p>
+    </form>
+    <p>이미 계정이 있으신가요? <a href="{{ url_for('login') }}">로그인</a></p>
+</body>
+</html>
