@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+.env
+
+# OS 관련
+.DS_Store
+Thumbs.db
+
+# Python virtual environment
+venv/
