@@ -22,7 +22,7 @@ def get_db_connection():
         conn = MySQLdb.connect(
             host=os.getenv('DB_HOST'),
             user=os.getenv('DB_USER'),
-            passwd=os.getenv('DB_PASSWORD'),
+            passwd=os.getenv('DB_PASS'),
             db=os.getenv('DB_NAME'),
             charset='utf8mb4'
         )
@@ -66,27 +66,63 @@ def prepare_data(conn, user_ids, item_ids):
     (interactions_matrix, weights_matrix) = dataset.build_interactions(
         ((user_id, item_id, weight) for (user_id, item_id), weight in zip(interactions, weights))
     )
+    
+    # --- DEBUGGING PRINTS (최종 수정 부분) ---
+    print(f"DEBUG: prepare_data - Interactions collected: {len(interactions)}")
+    print(f"DEBUG: interactions_matrix shape: {interactions_matrix.shape}")
+    print(f"DEBUG: weights_matrix shape: {weights_matrix.shape}")
+    print(f"DEBUG: num_users: {interactions_matrix.shape[0]}, num_items: {interactions_matrix.shape[1]}") # <--- 여기 수정
+    # --- END DEBUGGING PRINTS ---
+
     return dataset, interactions_matrix, weights_matrix
 
 def train_and_recommend(dataset, interactions_matrix, weights_matrix, user_ids_to_recommend):
     model = LightFM(loss='warp', no_components=30)
     logger.info("LightFM 모델 학습 시작...")
-    model.fit(interactions_matrix, sample_weight=weights_matrix, epochs=30, num_threads=os.cpu_count() or 1)
+    
+    # --- DEBUGGING PRINT ---
+    print("DEBUG: model.fit()을 호출하기 직전입니다.")
+    # --- END DEBUGGING PRINT ---
+    
+    # 변경 후:
+    model.fit(interactions_matrix, sample_weight=weights_matrix, epochs=5, num_threads=os.cpu_count() or 1) 
     logger.info("LightFM 모델 학습 완료.")
+    
+    # --- DEBUGGING PRINT ---
+    print("DEBUG: model.fit() 함수가 끝났습니다.")
+    # --- END DEBUGGING PRINT ---
 
     recommendations = {}
     for user_db_id in user_ids_to_recommend:
         try:
+            # LightFM ID 매핑이 없을 경우 KeyError 방지
+            if user_db_id not in dataset.mapping()[0]:
+                logger.warning(f"User ID {user_db_id} not found in LightFM dataset mapping. Skipping recommendations for this user.")
+                recommendations[user_db_id] = []
+                continue
+
             user_lightfm_id = dataset.mapping()[0][user_db_id]
-            known_positive_items = interactions_matrix.tocsr()[user_lightfm_id].indices
-            scores = model.predict(user_lightfm_id, np.arange(dataset.config.num_items))
+            
+            # known_positive_items가 비어있을 경우를 대비
+            known_positive_items = interactions_matrix.tocsr()[user_lightfm_id].indices if user_lightfm_id < interactions_matrix.shape[0] else np.array([])
+            
+            # scores 계산 부분 (최종 수정)
+            scores = model.predict(user_lightfm_id, np.arange(interactions_matrix.shape[1])) # <--- 여기 수정
+            
             top_items_lightfm_ids = np.argsort(-scores)
+            
             item_id_map = {v: k for k, v in dataset.mapping()[2].items()}
-            recommended_article_db_ids = [item_id_map[item_lightfm_id] for item_lightfm_id in top_items_lightfm_ids if item_lightfm_id not in known_positive_items][:20]
+            
+            # 추천 아이템 필터링 및 슬라이싱
+            recommended_article_db_ids = [
+                item_id_map[item_lightfm_id] 
+                for item_lightfm_id in top_items_lightfm_ids 
+                if item_lightfm_id not in known_positive_items and item_lightfm_id in item_id_map
+            ][:20]
             recommendations[user_db_id] = recommended_article_db_ids
             logger.info(f"User {user_db_id}: {len(recommended_article_db_ids)} recommendations generated.")
         except KeyError:
-            logger.warning(f"User ID {user_db_id} not found in LightFM dataset.")
+            logger.warning(f"User ID {user_db_id} not found in LightFM dataset mapping. (Already checked, but secondary catch)")
             recommendations[user_db_id] = []
         except Exception as e:
             logger.error(f"Error generating recommendations for user {user_db_id}: {str(e)}", exc_info=True)

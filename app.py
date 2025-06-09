@@ -69,19 +69,19 @@ def get_recommended_articles(user_id):
         search_keywords = [(row['search_term'], row['frequency']) for row in cur.fetchall()]
         
         cur.execute("""
-            SELECT k.keyword, COUNT(*) as weight
+            SELECT k.keyword_text, COUNT(*) as weight
             FROM user_article_log ual
             JOIN article_keywords ak ON ual.article_id = ak.article_id
             JOIN keywords k ON ak.keyword_id = k.id
             WHERE ual.user_id = %s AND ual.action_type IN ('view', 'click_external_link')
-            GROUP BY k.keyword
+            GROUP BY k.keyword_text
             ORDER BY weight DESC
             LIMIT 5
         """, (user_id,))
-        action_keywords = [(row['keyword'], row['weight'] * 0.5) for row in cur.fetchall()]
+        action_keywords = [(row['keyword_text'], row['weight'] * 0.5) for row in cur.fetchall()]
         
         cur.execute("""
-            SELECT k.keyword, uf.feedback_type
+            SELECT k.keyword_text, uf.feedback_type
             FROM user_feedback uf
             JOIN article_keywords ak ON uf.article_id = ak.article_id
             JOIN keywords k ON ak.keyword_id = k.id
@@ -95,7 +95,7 @@ def get_recommended_articles(user_id):
         for keyword, weight in action_keywords:
             keyword_weights[keyword] = keyword_weights.get(keyword, 0) + weight
         for row in feedback_keywords:
-            keyword = row['keyword']
+            keyword = row['keyword_text']
             weight = 2 if row['feedback_type'] == 'like' else -2
             keyword_weights[keyword] = keyword_weights.get(keyword, 0) + weight
         
@@ -121,7 +121,7 @@ def get_recommended_articles(user_id):
                 FROM articles a
                 JOIN article_keywords ak ON a.id = ak.article_id
                 JOIN keywords k ON ak.keyword_id = k.id
-                WHERE k.keyword = %s AND a.id NOT IN (%s)
+                WHERE k.keyword_text = %s AND a.id NOT IN (%s)
                 ORDER BY a.published_at DESC
                 LIMIT 2
             """, (keyword, ','.join(map(str, disliked_article_ids)) if disliked_article_ids else '0'))
@@ -236,7 +236,7 @@ def search_news():
                 LEFT JOIN keywords k ON ak.keyword_id = k.id
                 WHERE a.title LIKE %s
                    OR a.summary LIKE %s
-                   OR k.keyword LIKE %s
+                   OR k.keyword_text LIKE %s
                 ORDER BY a.published_at DESC
                 LIMIT 50
             """
