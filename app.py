@@ -5,6 +5,7 @@ from flask_bcrypt import Bcrypt
 from dotenv import load_dotenv
 import logging
 import MySQLdb
+import random
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
@@ -47,7 +48,6 @@ def log_user_action(user_id, article_id, action_type, read_time=None, scroll_dep
             cur.close()
 
 def get_recommended_articles(user_id):
-    """사용자 관심 키워드를 기반으로 추천 기사 제공"""
     cur = None
     try:
         cur = mysql.connection.cursor()
@@ -56,15 +56,24 @@ def get_recommended_articles(user_id):
         cur.execute("SELECT COUNT(*) AS count FROM user_article_log WHERE user_id = %s", (user_id,))
         action_count = cur.fetchone()['count']
         if search_count < 5 and action_count < 5:
-            return []
+            cur.execute("""
+                SELECT a.id, a.title, a.summary, a.category, a.published_at, a.url
+                FROM articles a
+                LEFT JOIN user_article_log ual ON a.id = ual.article_id
+                GROUP BY a.id
+                ORDER BY COUNT(ual.id) DESC, a.published_at DESC
+                LIMIT 10
+            """)
+            return cur.fetchall()
 
+        # 기존 키워드 추출 로직
         cur.execute("""
             SELECT search_term, COUNT(*) as frequency
             FROM user_searches
             WHERE user_id = %s
             GROUP BY search_term
             ORDER BY frequency DESC
-            LIMIT 5
+            LIMIT 10
         """, (user_id,))
         search_keywords = [(row['search_term'], row['frequency']) for row in cur.fetchall()]
         
@@ -76,7 +85,7 @@ def get_recommended_articles(user_id):
             WHERE ual.user_id = %s AND ual.action_type IN ('view', 'click_external_link')
             GROUP BY k.keyword_text
             ORDER BY weight DESC
-            LIMIT 5
+            LIMIT 10
         """, (user_id,))
         action_keywords = [(row['keyword_text'], row['weight'] * 0.5) for row in cur.fetchall()]
         
@@ -96,16 +105,11 @@ def get_recommended_articles(user_id):
             keyword_weights[keyword] = keyword_weights.get(keyword, 0) + weight
         for row in feedback_keywords:
             keyword = row['keyword_text']
-            weight = 2 if row['feedback_type'] == 'like' else -2
+            weight = 2 if row['feedback_type'] == 'like' else -3 if row['feedback_type'] == 'not_interested' else -2
             keyword_weights[keyword] = keyword_weights.get(keyword, 0) + weight
         
-        keywords = sorted(
-            [(k, w) for k, w in keyword_weights.items() if w > 0],
-            key=lambda x: x[1], reverse=True
-        )[:5]
-        keywords = [k for k, w in keywords]
-        if not keywords:
-            return []
+        keywords = sorted([(k, w) for k, w in keyword_weights.items() if w > 0], key=lambda x: x[1], reverse=True)[:10]
+        selected_keywords = random.choices([k for k, w in keywords], weights=[w for k, w in keywords], k=5)
         
         cur.execute("""
             SELECT article_id
@@ -115,7 +119,8 @@ def get_recommended_articles(user_id):
         disliked_article_ids = [row['article_id'] for row in cur.fetchall()]
         
         recommended_articles = []
-        for keyword in keywords:
+        categories = set()
+        for keyword in selected_keywords:
             cur.execute("""
                 SELECT a.id, a.title, a.summary, a.category, a.published_at, a.url
                 FROM articles a
@@ -125,8 +130,14 @@ def get_recommended_articles(user_id):
                 ORDER BY a.published_at DESC
                 LIMIT 2
             """, (keyword, ','.join(map(str, disliked_article_ids)) if disliked_article_ids else '0'))
-            recommended_articles.extend(cur.fetchall())
-        
+            articles = cur.fetchall()
+            for article in articles:
+                if article['category'] not in categories or len(recommended_articles) < 5:
+                    recommended_articles.append(article)
+                    categories.add(article['category'])
+                if len(recommended_articles) >= 10:
+                    break
+                
         seen_ids = set()
         unique_articles = []
         for article in recommended_articles:
@@ -316,8 +327,6 @@ def log_action():
 
 @app.route('/feedback', methods=['POST'])
 def feedback():
-    """좋아요/싫어요 피드백 저장 또는 취소"""
-    cur = None
     if 'user_id' not in session:
         return jsonify({'status': 'error', 'message': '로그인이 필요합니다.'}), 401
     data = request.get_json()
@@ -331,7 +340,11 @@ def feedback():
             WHERE user_id = %s AND article_id = %s
         """, (session['user_id'], article_id))
         existing_feedback = cur.fetchone()
-        
+
+        # 피드백과 함께 action_type 기록
+        if feedback_type in ['like', 'dislike']:
+            log_user_action(session['user_id'], article_id, f'feedback_{feedback_type}')
+
         if feedback_type == 'cancel':
             if existing_feedback:
                 cur.execute("""
@@ -342,10 +355,10 @@ def feedback():
                 return jsonify({'status': 'success', 'message': '피드백이 취소되었습니다.'}), 200
             else:
                 return jsonify({'status': 'error', 'message': '취소할 피드백이 없습니다.'}), 400
-        
+
         if existing_feedback:
             return jsonify({'status': 'error', 'message': '이미 피드백을 제출했습니다.'}), 400
-        
+
         if feedback_type in ['like', 'dislike']:
             cur.execute("""
                 INSERT INTO user_feedback (user_id, article_id, feedback_type)
@@ -353,7 +366,7 @@ def feedback():
             """, (session['user_id'], article_id, feedback_type))
             mysql.connection.commit()
             return jsonify({'status': 'success', 'message': f'{feedback_type} 피드백이 저장되었습니다.'}), 200
-        
+
         return jsonify({'status': 'error', 'message': '유효하지 않은 피드백 유형입니다.'}), 400
     except MySQLdb.IntegrityError:
         mysql.connection.rollback()
