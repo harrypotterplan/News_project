@@ -17,8 +17,7 @@ CREATE TABLE users (
 -- 2. `articles` 테이블 생성
 -- 네이버 API에서 크롤링한 뉴스 기사 정보를 저장
 CREATE TABLE articles (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    api_article_id VARCHAR(255) UNIQUE,       -- 네이버 API 등에서 받아온 기사 고유 ID (중복 방지)
+    id INT AUTO_INCREMENT PRIMARY KEY, 
     title TEXT NOT NULL,                      -- 기사 제목
     summary TEXT,                             -- 네이버 API에서 받아온 요약문 (없을 경우 NULL 허용)
     category VARCHAR(50),                     -- 기사 분류 (예: 정치, 경제, IT 등)
@@ -26,8 +25,7 @@ CREATE TABLE articles (
     url TEXT NOT NULL,                        -- 기사 원본 URL
     full_content TEXT,                        -- 기사 본문 저장
     INDEX idx_published_at (published_at),    -- 검색/정렬 최적화
-    INDEX idx_category (category),            -- 카테고리별 검색 최적화
-    INDEX idx_api_article_id (api_article_id) -- API 기사 ID 검색 최적화
+    INDEX idx_category (category)            -- 카테고리별 검색 최적화
 );
 
 -- 3. `keywords` 테이블 생성
@@ -92,11 +90,12 @@ CREATE TABLE user_feedback (
 
 -- 8. 추천된 기사들을 저장하는 테이블
 CREATE TABLE recommended_articles (
-    id INT AUTO_INCREMENT PRIMARY KEY,
+   id INT AUTO_INCREMENT PRIMARY KEY,
     user_id INT NOT NULL,
     article_id INT NOT NULL,
     recommendation_score FLOAT, -- 추천 점수 (모델이 부여한 가중치 등)
     recommended_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    recommendation_rank INT NOT NULL DEFAULT 0, -- 쉼표 추가
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
     FOREIGN KEY (article_id) REFERENCES articles(id) ON DELETE CASCADE,
     UNIQUE (user_id, article_id), -- 특정 사용자에게 특정 기사가 한 번만 추천되도록

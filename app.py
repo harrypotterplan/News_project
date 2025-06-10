@@ -27,8 +27,35 @@ app.config['MYSQL_CURSORCLASS'] = 'DictCursor'
 mysql = MySQL(app)
 bcrypt = Bcrypt(app)
 
+def store_recommendations(user_id, article_ids):
+    """추천 결과를 recommended_articles에 저장
+    - user_id: 현재 사용자 ID
+    - article_ids: 추천된 기사 ID 리스트
+    - 테이블에 추천 순위와 점수 저장"""
+    try:
+        cur = mysql.connection.cursor()
+        cur.execute("TRUNCATE TABLE recommended_articles")  # 기존 데이터 삭제
+        if not article_ids:
+            logger.warning(f"No article_ids to store for user {user_id}")
+            return
+        for rank, article_id in enumerate(article_ids, 1):  # 순위 부여 (1부터 시작)
+            cur.execute("""
+                INSERT INTO recommended_articles (user_id, article_id, recommendation_rank, recommendation_score)
+                VALUES (%s, %s, %s, %s)
+            """, (user_id, article_id, rank, 1.0 / rank))  # 순위에 따른 점수 계산
+        mysql.connection.commit()
+        logger.info(f"Stored {len(article_ids)} recommendations for user {user_id}")
+    except MySQLdb.Error as e:
+        mysql.connection.rollback()
+        logger.error(f"Error storing recommendations for user {user_id}: {str(e)}")
+    finally:
+        cur.close()
+
 def get_recommended_articles(user_id):
-    """recommended_articles에서 추천 조회"""
+    """recommended_articles에서 추천 조회
+    - user_id: 현재 사용자 ID
+    - 순위 기준으로 상위 10개 기사 반환
+    - 참고: 현재는 키워드 추천으로 대체되었으나, 호환성을 위해 남겨둠"""
     try:
         cur = mysql.connection.cursor()
         cur.execute("""
@@ -40,16 +67,18 @@ def get_recommended_articles(user_id):
             LIMIT 10
         """, (user_id,))
         articles = cur.fetchall()
-        logger.debug(f"LightFM recommendations for user {user_id}: {len(articles)} articles")
+        logger.debug(f"Retrieved {len(articles)} recommendations for user {user_id}")
         return articles
     except MySQLdb.Error as e:
-        logger.error(f"Error getting recommended articles for user {user_id}: {str(e)}")
+        logger.error(f"Error getting recommended articles: {str(e)}")
         return []
     finally:
         cur.close()
 
 def get_keyword_recommendations(user_id):
-    """키워드 기반 추천"""
+    """키워드 기반 추천
+    - user_id: 현재 사용자 ID
+    - 검색어, 행동 로그, 피드백을 기반으로 기사 추천"""
     cur = None
     try:
         cur = mysql.connection.cursor()
@@ -70,6 +99,7 @@ def get_keyword_recommendations(user_id):
                 LIMIT 10
             """)
             articles = cur.fetchall()
+            logger.debug(f"Popular articles returned: {len(articles)}")
             return articles
 
         cur.execute("""
@@ -130,6 +160,7 @@ def get_keyword_recommendations(user_id):
                 LIMIT 10
             """)
             articles = cur.fetchall()
+            logger.debug(f"Popular articles returned: {len(articles)}")
             return articles
 
         selected_keywords = random.choices([k for k, w in keywords], weights=[w for k, w in keywords], k=3)
@@ -143,10 +174,10 @@ def get_keyword_recommendations(user_id):
                 FROM articles a
                 JOIN article_keywords ak ON a.id = ak.article_id
                 JOIN keywords k ON ak.keyword_id = k.id
-                WHERE k.keyword_text = %s AND a.id NOT IN (%s)
+                WHERE k.keyword_text = %s AND a.id NOT IN ({','.join(map(str, disliked_article_ids)) if disliked_article_ids else '0'})
                 ORDER BY a.published_at DESC
                 LIMIT 3
-            """, (keyword, ','.join(map(str, disliked_article_ids)) if disliked_article_ids else '0'))
+            """, (keyword,))
             articles = cur.fetchall()
             recommended_articles.extend(articles)
             if len(recommended_articles) >= 10:
@@ -160,8 +191,13 @@ def get_keyword_recommendations(user_id):
                 seen_ids.add(article['id'])
             if len(unique_articles) >= 10:
                 break
+        logger.debug(f"Unique articles generated: {len(unique_articles)}")
 
-        logger.debug(f"Keyword recommendations for user {user_id}: {len(unique_articles)} articles")
+        # 추천 결과를 recommended_articles에 저장
+        article_ids = [article['id'] for article in unique_articles]
+        store_recommendations(user_id, article_ids)
+
+        logger.info(f"Keyword recommendations for user {user_id}: {len(unique_articles)} articles")
         return unique_articles
     except MySQLdb.Error as e:
         logger.error(f"Error getting keyword recommendations: {str(e)}")
@@ -171,7 +207,11 @@ def get_keyword_recommendations(user_id):
             cur.close()
 
 def log_user_action(user_id, article_id, action_type, read_time=None, scroll_depth=None):
-    """사용자 행동 로깅"""
+    """사용자 행동 로깅
+    - user_id: 현재 사용자 ID
+    - article_id: 기사 ID
+    - action_type: 행동 유형 (view, read 등)
+    - read_time, scroll_depth: 추가 데이터 (선택)"""
     logger.debug(f"Logging action: user_id={user_id}, article_id={article_id}, action_type={action_type}")
     try:
         cur = mysql.connection.cursor()
@@ -192,11 +232,11 @@ def log_user_action(user_id, article_id, action_type, read_time=None, scroll_dep
 def home():
     if 'user_id' not in session:
         return redirect(url_for('login'))
-    lightfm_articles = get_recommended_articles(session['user_id'])
+    # LightFM 대신 키워드 추천만 사용
     keyword_articles = get_keyword_recommendations(session['user_id'])
-    logger.debug(f"Home rendered for user {session['user_id']}: LightFM={len(lightfm_articles)}, Keyword={len(keyword_articles)}")
+    logger.debug(f"Home rendered for user {session['user_id']}: Keyword={len(keyword_articles)}")
     return render_template('home.html', username=session['username'], articles=[],
-                           lightfm_articles=lightfm_articles, keyword_articles=keyword_articles)
+                           keyword_articles=keyword_articles)  # lightfm_articles 제거
 
 @app.route('/register', methods=['GET', 'POST'])
 def register():
@@ -291,8 +331,8 @@ def search_news():
             logger.error(f"Search error for query '{query}': {str(e)}")
         finally:
             cur.close()
-    return render_template('home.html', articles=articles_results, username=username, search_query=query,
-                           lightfm_articles=[], keyword_articles=[])
+    return render_template('home.html', articles=articles_results, username=username,
+                           keyword_articles=[])  # lightfm_articles 제거
 
 @app.route('/article/<int:article_id>')
 def article_detail(article_id):
