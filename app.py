@@ -6,6 +6,7 @@ from flask_mysqldb import MySQL
 from flask_bcrypt import Bcrypt
 from dotenv import load_dotenv
 import random
+import uuid
 
 # 로깅 설정
 logging.basicConfig(filename='crawler.log', level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -27,29 +28,40 @@ app.config['MYSQL_CURSORCLASS'] = 'DictCursor'
 mysql = MySQL(app)
 bcrypt = Bcrypt(app)
 
-def store_recommendations(user_id, article_ids):
-    """추천 결과를 recommended_articles에 저장
-    - user_id: 현재 사용자 ID
-    - article_ids: 추천된 기사 ID 리스트
-    - 테이블에 추천 순위와 점수 저장"""
+def store_recommendations(user_id, article_ids, batch_id=None, algorithm_version='keyword_v1'):
+    """
+    사용자에게 추천된 기사 목록을 recommended_articles 테이블에 저장합니다.
+    이전 추천을 삭제하지 않고 새 이력을 추가합니다.
+    """
     try:
-        cur = mysql.connection.cursor()
-        cur.execute("TRUNCATE TABLE recommended_articles")  # 기존 데이터 삭제
-        if not article_ids:
-            logger.warning(f"No article_ids to store for user {user_id}")
-            return
-        for rank, article_id in enumerate(article_ids, 1):  # 순위 부여 (1부터 시작)
-            cur.execute("""
-                INSERT INTO recommended_articles (user_id, article_id, recommendation_rank, recommendation_score)
-                VALUES (%s, %s, %s, %s)
-            """, (user_id, article_id, rank, 1.0 / rank))  # 순위에 따른 점수 계산
-        mysql.connection.commit()
-        logger.info(f"Stored {len(article_ids)} recommendations for user {user_id}")
+        conn = mysql.connection.cursor().connection
+        cur = conn.cursor()
+        session_id = str(uuid.uuid4())[:8] if batch_id is None else batch_id
+
+        for rank, article_id in enumerate(article_ids, 1):
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO recommended_articles 
+                    (user_id, article_id, recommendation_rank, recommendation_score, recommended_at, batch_id, recommendation_algorithm_version, recommendation_session_id)
+                    VALUES (%s, %s, %s, %s, NOW(), %s, %s, %s)
+                    """,
+                    (user_id, article_id, rank, 1.0 / rank, batch_id, algorithm_version, session_id)
+                )
+            except MySQLdb.Error as e:
+                if "1062" in str(e):  # Duplicate entry
+                    logger.debug(f"Recommendation already exists for user {user_id}, article {article_id}. Skipping.")
+                else:
+                    raise e
+        conn.commit()
+        logger.info(f"Stored {len(article_ids)} recommendations for user {user_id}, batch_id={batch_id}, session_id={session_id}")
     except MySQLdb.Error as e:
-        mysql.connection.rollback()
         logger.error(f"Error storing recommendations for user {user_id}: {str(e)}")
+        if conn:
+            conn.rollback()
     finally:
-        cur.close()
+        if cur:
+            cur.close()
 
 def get_recommended_articles(user_id):
     """recommended_articles에서 추천 조회
@@ -75,7 +87,7 @@ def get_recommended_articles(user_id):
     finally:
         cur.close()
 
-def get_keyword_recommendations(user_id):
+def get_keyword_recommendations(user_id, batch_id=None):
     """키워드 기반 추천
     - user_id: 현재 사용자 ID
     - 검색어, 행동 로그, 피드백을 기반으로 기사 추천"""
@@ -195,7 +207,7 @@ def get_keyword_recommendations(user_id):
 
         # 추천 결과를 recommended_articles에 저장
         article_ids = [article['id'] for article in unique_articles]
-        store_recommendations(user_id, article_ids)
+        store_recommendations(user_id, article_ids, batch_id=batch_id, algorithm_version='keyword_v1')
 
         logger.info(f"Keyword recommendations for user {user_id}: {len(unique_articles)} articles")
         return unique_articles

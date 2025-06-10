@@ -2,7 +2,9 @@ import os
 import logging
 import MySQLdb
 import csv
-from app import app, get_keyword_recommendations  # app과 함수 임포트
+import pandas as pd
+from sklearn.metrics import precision_score, recall_score, f1_score
+from app import app, get_keyword_recommendations
 from dotenv import load_dotenv
 
 # 로깅 설정
@@ -13,100 +15,91 @@ def get_db_connection():
     """MySQL 데이터베이스 연결 설정"""
     load_dotenv()
     return MySQLdb.connect(
-        host=os.getenv('DB_HOST'),
+        host=os.getenv('DB_HOST', 'localhost'),
         user=os.getenv('DB_USER'),
         passwd=os.getenv('DB_PASS'),
-        db=os.getenv('DB_NAME'),
+        db=os.getenv('DB_NAME', 'AI_master'),
         port=int(os.getenv('DB_PORT', 3306)),
         charset='utf8mb4'
     )
 
-def load_test_data(file_path):
-    """테스트 데이터 로드"""
-    test_data = {}
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            if not reader.fieldnames or 'user_id' not in reader.fieldnames or 'article_id' not in reader.fieldnames:
-                logger.error(f"Invalid CSV format in {file_path}: missing required columns")
-                return {}
-            for row in reader:
-                user_id = int(row['user_id'])
-                article_id = int(row['article_id'])
-                if user_id not in test_data:
-                    test_data[user_id] = set()
-                test_data[user_id].add(article_id)
-        logger.debug(f"Loaded test data for {len(test_data)} users from {file_path}")
-        return test_data
-    except FileNotFoundError:
-        logger.error(f"Test data file not found: {file_path}")
-        return {}
-    except Exception as e:
-        logger.error(f"Error loading test data: {str(e)}")
-        return {}
-
-def evaluate_keyword_model():
-    """키워드 추천 모델의 성능 평가
-    - 정밀도, 재현율, F1 스코어를 계산"""
-    with app.app_context():  # Flask 앱 컨텍스트 생성
-        conn = get_db_connection()
+def evaluate_keyword_model(batch_id, feedback_file='test_feedback.csv'):
+    """키워드 추천 모델 평가. batch_id로 추천 세션 고정."""
+    with app.app_context():
+        conn = None
+        cur = None
         try:
+            # DB 연결
+            conn = get_db_connection()
             cur = conn.cursor(MySQLdb.cursors.DictCursor)
-            cur.execute("SELECT DISTINCT id FROM users LIMIT 5")  # 사용자 ID 조회
-            user_ids = [row['id'] for row in cur.fetchall()]
-            logger.debug(f"Retrieved user IDs: {user_ids}")
-            
-            # 테스트 데이터 로드 (프로젝트 폴더 기준)
-            test_data = load_test_data('test_feedback.csv')
-            if not test_data:
-                logger.warning("No test data loaded")
-                print("No test data loaded.")
-                return
+            logger.info(f"Connected to database for evaluation with batch_id={batch_id}")
 
-            total_precision = 0
-            total_recall = 0
-            num_users = 0
+            # 피드백 데이터 로드
+            feedback_df = pd.read_csv(feedback_file)
+            users = feedback_df['user_id'].unique()
+            logger.info(f"Evaluating for {len(users)} users: {users}")
 
-            for user_id in user_ids:
-                # 실제 관심 기사 (테스트 데이터)
-                true_positives = test_data.get(user_id, set())
-                logger.debug(f"User {user_id} true positives: {true_positives}")
+            # 평가 메트릭 초기화
+            precisions, recalls, f1s = [], [], []
 
-                # 추천 기사
-                recommended = get_keyword_recommendations(user_id)
-                recommended_ids = set(article['id'] for article in recommended)
-                logger.debug(f"User {user_id} recommended IDs: {recommended_ids}")
+            for user_id in users:
+                # 추천 생성 (이미 저장된 경우 DB에서 조회)
+                cur.execute(
+                    """
+                    SELECT article_id 
+                    FROM recommended_articles 
+                    WHERE user_id = %s AND batch_id = %s
+                    ORDER BY recommendation_rank
+                    """,
+                    (user_id, batch_id)
+                )
+                stored_article_ids = [row['article_id'] for row in cur.fetchall()]
 
-                if not true_positives or not recommended_ids:
-                    logger.debug(f"Skipping user {user_id}: no true positives or recommendations")
-                    continue
+                if not stored_article_ids:
+                    # 추천이 없으면 새로 생성
+                    recommendations = get_keyword_recommendations(user_id, batch_id=batch_id)
+                    stored_article_ids = [rec['id'] for rec in recommendations]
+                    logger.debug(f"Generated {len(stored_article_ids)} recommendations for user {user_id}")
 
-                # 정밀도 계산 (추천 중 맞는 비율)
-                precision = len(true_positives & recommended_ids) / len(recommended_ids) if recommended_ids else 0
-                # 재현율 계산 (실제 중 추천된 비율)
-                recall = len(true_positives & recommended_ids) / len(true_positives) if true_positives else 0
+                # 피드백 데이터 필터링
+                user_feedback = feedback_df[feedback_df['user_id'] == user_id]
+                positive_feedback = user_feedback[user_feedback['feedback_type'] == 'like']['article_id'].tolist()
 
-                total_precision += precision
-                total_recall += recall
-                num_users += 1
-                logger.debug(f"User {user_id}: Precision={precision:.4f}, Recall={recall:.4f}")
+                # 실제/예측 레이블 생성
+                y_true = [1 if aid in positive_feedback else 0 for aid in stored_article_ids]
+                y_pred = [1] * len(stored_article_ids)  # 추천된 기사는 모두 긍정으로 가정
 
-            if num_users > 0:
-                avg_precision = total_precision / num_users
-                avg_recall = total_recall / num_users
-                avg_f1 = 2 * (avg_precision * avg_recall) / (avg_precision + avg_recall) if (avg_precision + avg_recall) > 0 else 0
-                logger.info(f"Average Precision: {avg_precision:.4f}, Recall: {avg_recall:.4f}, F1: {avg_f1:.4f}")
-                print(f"Average Precision: {avg_precision:.4f}, Recall: {avg_recall:.4f}, F1: {avg_f1:.4f}")
-            else:
-                logger.warning("No users with sufficient data for evaluation")
-                print("No users with sufficient data for evaluation")
+                # 메트릭 계산
+                if len(y_true) > 0:
+                    precision = precision_score(y_true, y_pred, zero_division=0)
+                    recall = recall_score(y_true, y_pred, zero_division=0)
+                    f1 = f1_score(y_true, y_pred, zero_division=0)
+                    precisions.append(precision)
+                    recalls.append(recall)
+                    f1s.append(f1)
+                    logger.info(f"User {user_id}: Precision={precision:.3f}, Recall={recall:.3f}, F1={f1:.3f}")
 
-        except MySQLdb.Error as e:
+            # 평균 메트릭
+            avg_precision = sum(precisions) / len(precisions) if precisions else 0
+            avg_recall = sum(recalls) / len(recalls) if recalls else 0
+            avg_f1 = sum(f1s) / len(f1s) if f1s else 0
+            logger.info(f"Average: Precision={avg_precision:.3f}, Recall={avg_recall:.3f}, F1={avg_f1:.3f}")
+
+            return {
+                'precision': avg_precision,
+                'recall': avg_recall,
+                'f1': avg_f1
+            }
+
+        except Exception as e:
             logger.error(f"Evaluation error: {str(e)}")
-            print(f"Evaluation error: {str(e)}")
+            raise e
         finally:
-            cur.close()
-            conn.close()
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
 
 if __name__ == "__main__":
-    evaluate_keyword_model()
+    results = evaluate_keyword_model(batch_id="test_batch_20250611")
+    print(f"Evaluation Results: {results}")
