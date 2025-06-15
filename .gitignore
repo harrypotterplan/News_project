@@ -11,3 +11,52 @@ Thumbs.db
 venv/
 
 기계학습_기말_프로젝트_1팀.ipynb
+
+# 운영 체제별 파일
+.DS_Store
+Thumbs.db
+
+# IDE 관련 파일 (VS Code)
+.vscode/
+
+# 파이썬 관련 파일
+__pycache__/
+*.pyc
+*.pyd
+*.so
+*.egg
+*.egg-info/
+build/
+dist/
+
+# Jupyter Notebook 파일
+.ipynb_checkpoints/
+*.ipynb
+
+# 로그 파일
+*.log
+app.log
+bpr_model.log
+dummy_data.log
+evaluation.log
+lightfm_model.log
+ml_model.log
+svd_model.log
+
+# 데이터 및 모델 파일 (특히 대용량 파일)
+*.pkl
+ml_data.pkl
+lightfm_dataset.pkl
+lightfm_test_interactions.pkl
+lightfm_train_interactions.pkl
+model_data/ # 모델 저장 폴더 전체를 무시 (필요 시)
+test_feedback.csv # 테스트용 데이터 파일도 무시
+
+# 개인 작업 파일 (명시적으로 무시)
+쓰레기.py
+기계학습_기말_프로젝트_1팀.ipynb # 이전에 문제가 되었던 파일
+사용자 맞춤형 추천 및 Ai 기반 뉴스 요약 추천 시스템.docx
+
+# 기타 임시 파일
+*.tmp
+*.bak
