@@ -60,3 +60,14 @@ test_feedback.csv # 테스트용 데이터 파일도 무시
 # 기타 임시 파일
 *.tmp
 *.bak
+
+#실험파일들
+evaluation.log    # M 표시된 파일, 로그라면 일반적으로 무시
+lightfm_model.py
+ml_model.py
+recommander.py
+sample_recommander.py
+svd_model.py
+test.py
+testst.py
+templates/thomthom.html # templates 폴더 안에 있다면 경로 명시
