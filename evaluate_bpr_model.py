@@ -10,14 +10,14 @@ import os
 from app import get_bpr_recommendations, get_keyword_recommendations
 
 # 로깅 설정
-logging.basicConfig(filename='evaluate_models.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(filename='evaluate_bpr.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Flask 앱 설정
 app = Flask(__name__)
 load_dotenv()
 
-# MySQL 설정
+# MySQL 설정 (.env에서 가져옴)
 app.config['MYSQL_HOST'] = os.getenv('DB_HOST')
 app.config['MYSQL_USER'] = os.getenv('DB_USER')
 app.config['MYSQL_PASSWORD'] = os.getenv('DB_PASS')
@@ -57,11 +57,13 @@ def evaluate_model(model_name, get_recommendations_func):
     """모델 평가"""
     try:
         cur = mysql.connection.cursor()
+        # user_feedback에서 'like' 피드백 가져오기
         cur.execute("SELECT user_id, article_id FROM user_feedback WHERE feedback_type = 'like'")
         feedback = cur.fetchall()
-        logger.info(f"Retrieved {len(feedback)} 'like' feedbacks")
+        logger.info(f"Retrieved {len(feedback)} 'like' feedbacks from user_feedback")
         cur.close()
 
+        # 사용자별 정답 레이블 생성
         y_true = {}
         for row in feedback:
             user_id = row['user_id']
@@ -71,15 +73,18 @@ def evaluate_model(model_name, get_recommendations_func):
             y_true[user_id].append(article_id)
         logger.info(f"Users with 'like' feedback: {len(y_true)}")
 
+        # 추천 생성 및 평가
         y_pred = {}
         for user_id in y_true:
             articles = get_recommendations_func(user_id, top_n=10)
             y_pred[user_id] = [article['id'] for article in articles]
             logger.debug(f"User {user_id}: True={y_true.get(user_id, [])} Pred={y_pred.get(user_id, [])}")
 
+        # 메트릭 계산
         map_at_10 = calculate_map_at_k([y_true.get(u, []) for u in y_true], [y_pred.get(u, []) for u in y_true], k=10)
         hit_rate_at_10 = calculate_hit_rate_at_k([y_true.get(u, []) for u in y_true], [y_pred.get(u, []) for u in y_true], k=10)
 
+        # NDCG@10 계산
         ndcg_scores = []
         for user_id in y_true:
             true_relevance = [1 if item in y_true[user_id] else 0 for item in y_pred.get(user_id, [])]
@@ -100,5 +105,7 @@ def evaluate_model(model_name, get_recommendations_func):
 
 if __name__ == "__main__":
     with app.app_context():
+        # 키워드 기반 모델 평가
         evaluate_model("Keyword", get_keyword_recommendations)
+        # BPR 모델 평가
         evaluate_model("BPR", get_bpr_recommendations)

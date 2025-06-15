@@ -1,112 +1,210 @@
-import os
+import pandas as pd
+import numpy as np
+from sklearn.metrics import ndcg_score
 import logging
 import MySQLdb
-import csv
-from app import app, get_keyword_recommendations  # app과 함수 임포트
+from flask import Flask
+from flask_mysqldb import MySQL
 from dotenv import load_dotenv
+import os
 
-# 로깅 설정
-logging.basicConfig(filename='crawler.log', level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+# app.py에서 필요한 함수만 임포트 (get_db_connection은 이 파일에서 정의하므로 제외)
+from app import get_keyword_recommendations, get_bpr_recommendations
+
+# 로깅 설정: 파일명도 좀 더 일반적인 evaluate_models.log로 변경
+logging.basicConfig(filename='evaluate_models.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Flask 앱 설정
+app = Flask(__name__)
+load_dotenv()
+
+# MySQL 설정 (이 파일 내에서 직접 설정)
+app.config['MYSQL_HOST'] = os.getenv('DB_HOST')
+app.config['MYSQL_USER'] = os.getenv('DB_USER')
+app.config['MYSQL_PASSWORD'] = os.getenv('DB_PASS')
+app.config['MYSQL_DB'] = os.getenv('DB_NAME')
+app.config['MYSQL_PORT'] = int(os.getenv('DB_PORT', 3306))
+app.config['MYSQL_CURSORCLASS'] = 'DictCursor'
+mysql = MySQL(app)
+
+# 이 파일 내에서 DB 연결 함수 정의 (app.py에서 가져올 필요 없음)
 def get_db_connection():
-    """MySQL 데이터베이스 연결 설정"""
-    load_dotenv()
-    return MySQLdb.connect(
-        host=os.getenv('DB_HOST'),
-        user=os.getenv('DB_USER'),
-        passwd=os.getenv('DB_PASS'),
-        db=os.getenv('DB_NAME'),
-        port=int(os.getenv('DB_PORT', 3306)),
-        charset='utf8mb4'
-    )
-
-def load_test_data(file_path):
-    """테스트 데이터 로드"""
-    test_data = {}
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            if not reader.fieldnames or 'user_id' not in reader.fieldnames or 'article_id' not in reader.fieldnames:
-                logger.error(f"Invalid CSV format in {file_path}: missing required columns")
-                return {}
-            for row in reader:
-                user_id = int(row['user_id'])
-                article_id = int(row['article_id'])
-                if user_id not in test_data:
-                    test_data[user_id] = set()
-                test_data[user_id].add(article_id)
-        logger.debug(f"Loaded test data for {len(test_data)} users from {file_path}")
-        return test_data
-    except FileNotFoundError:
-        logger.error(f"Test data file not found: {file_path}")
-        return {}
-    except Exception as e:
-        logger.error(f"Error loading test data: {str(e)}")
-        return {}
+        conn = MySQLdb.connect(
+            host=os.getenv('DB_HOST'),
+            user=os.getenv('DB_USER'),
+            passwd=os.getenv('DB_PASS'),
+            db=os.getenv('DB_NAME'),
+            port=int(os.getenv('DB_PORT', 3306)),
+            charset='utf8mb4'
+        )
+        # logger.debug("DB 연결 성공!") # 너무 많은 로그 방지를 위해 debug 레벨로 변경
+        return conn
+    except MySQLdb.Error as e:
+        logger.error(f"DB 연결 실패: {str(e)}", exc_info=True)
+        return None
 
-def evaluate_keyword_model():
-    """키워드 추천 모델의 성능 평가
-    - 정밀도, 재현율, F1 스코어를 계산"""
-    with app.app_context():  # Flask 앱 컨텍스트 생성
-        conn = get_db_connection()
-        try:
-            cur = conn.cursor(MySQLdb.cursors.DictCursor)
-            cur.execute("SELECT DISTINCT id FROM users LIMIT 5")  # 사용자 ID 조회
-            user_ids = [row['id'] for row in cur.fetchall()]
-            logger.debug(f"Retrieved user IDs: {user_ids}")
+
+def calculate_extended_metrics(predicted_ranks, actual_liked_articles, actual_interacted_articles, k=10):
+    ap_sum = 0.0
+    ndcg_sum = 0.0
+    hit_rate_sum = 0.0
+    num_users_evaluated = 0
+
+    for user_id, predicted_list in predicted_ranks.items():
+        if user_id not in actual_liked_articles or not actual_liked_articles[user_id]:
+            # logger.debug(f"User {user_id} has no liked articles. Skipping evaluation for this user.")
+            continue # 해당 사용자에 대해 실제로 좋아한 기사가 없으면 평가에서 제외
+
+        num_users_evaluated += 1
+        actual_relevant = set(actual_liked_articles[user_id])
+        actual_interacted = set(actual_interacted_articles.get(user_id, []))
+
+        # Calculate Average Precision (AP)
+        precision_at_k = []
+        hits = 0
+        for i, article_id in enumerate(predicted_list[:k], 1):
+            if article_id in actual_relevant:
+                hits += 1
+                precision_at_k.append(hits / i) # Precision@i
+        ap = sum(precision_at_k) / len(actual_relevant) if actual_relevant else 0.0 # 실제 관련 항목 수로 나눔 (MAP 정의에 따라)
+        ap_sum += ap
+
+        # Calculate Normalized Discounted Cumulative Gain (NDCG)
+        dcg = 0.0
+        idcg = 0.0
+        
+        # DCG calculation (using 2^relevance-1 / log2(i+1))
+        # BPR은 예측 점수 자체가 절대적인 관련성이 아니므로, 이진 관련성(1 또는 0)을 사용
+        # true_relevance를 1 (관련) 또는 0 (비관련)으로 단순화
+        for i, article_id in enumerate(predicted_list[:k]):
+            if article_id in actual_relevant:
+                dcg += 1.0 / np.log2(i + 2) # i+1이 0이 될 수 없으므로 i+2 (log2(1)부터 시작)
             
-            # 테스트 데이터 로드 (프로젝트 폴더 기준)
-            test_data = load_test_data('test_feedback.csv')
-            if not test_data:
-                logger.warning("No test data loaded")
-                print("No test data loaded.")
-                return
+        # Ideal DCG: 모든 관련 항목이 상위에 있다고 가정
+        # 실제 관련 항목 수만큼 1/log2(i+1)을 더함
+        for i in range(min(k, len(actual_relevant))): # 실제 relevant 한 아이템 수 만큼 idcg 계산
+            idcg += 1.0 / np.log2(i + 2)
+            
+        ndcg = dcg / idcg if idcg > 0 else 0.0
+        ndcg_sum += ndcg
 
-            total_precision = 0
-            total_recall = 0
-            num_users = 0
+        # Calculate HitRate (At least one liked item is in top-K)
+        if any(pred in actual_relevant for pred in predicted_list[:k]):
+            hit_rate_sum += 1
 
-            for user_id in user_ids:
-                # 실제 관심 기사 (테스트 데이터)
-                true_positives = test_data.get(user_id, set())
-                logger.debug(f"User {user_id} true positives: {true_positives}")
+    map_score = ap_sum / num_users_evaluated if num_users_evaluated > 0 else 0.0
+    ndcg_score = ndcg_sum / num_users_evaluated if num_users_evaluated > 0 else 0.0
+    hit_rate = hit_rate_sum / num_users_evaluated if num_users_evaluated > 0 else 0.0
+    
+    return map_score, ndcg_score, hit_rate
 
-                # 추천 기사
-                recommended = get_keyword_recommendations(user_id)
-                recommended_ids = set(article['id'] for article in recommended)
-                logger.debug(f"User {user_id} recommended IDs: {recommended_ids}")
+def evaluate_recommendation_model(user_id, model_type='keyword', batch_id=None, k=10):
+    with app.app_context():
+        conn = None
+        cur = None
+        try:
+            conn = get_db_connection() # 이 파일의 get_db_connection 사용
+            cur = conn.cursor(MySQLdb.cursors.DictCursor)
+            logger.info(f"Evaluating {model_type} model for user {user_id}, k={k}")
 
-                if not true_positives or not recommended_ids:
-                    logger.debug(f"Skipping user {user_id}: no true positives or recommendations")
-                    continue
+            # 'like' 피드백만 실제 정답(Ground Truth)으로 사용
+            cur.execute("SELECT article_id FROM user_feedback WHERE user_id = %s AND feedback_type = 'like'", (user_id,))
+            actual_liked_articles_ids = [row['article_id'] for row in cur.fetchall()]
+            
+            # 모든 상호작용 기록 (HitRate 계산용)
+            cur.execute("SELECT article_id FROM user_article_log WHERE user_id = %s", (user_id,))
+            actual_interacted_articles_ids_log = [row['article_id'] for row in cur.fetchall()]
+            cur.execute("SELECT article_id FROM user_feedback WHERE user_id = %s", (user_id,))
+            actual_interacted_articles_ids_feedback = [row['article_id'] for row in cur.fetchall()]
+            actual_interacted_articles_ids = list(set(actual_interacted_articles_ids_log + actual_interacted_articles_ids_feedback))
 
-                # 정밀도 계산 (추천 중 맞는 비율)
-                precision = len(true_positives & recommended_ids) / len(recommended_ids) if recommended_ids else 0
-                # 재현율 계산 (실제 중 추천된 비율)
-                recall = len(true_positives & recommended_ids) / len(true_positives) if true_positives else 0
 
-                total_precision += precision
-                total_recall += recall
-                num_users += 1
-                logger.debug(f"User {user_id}: Precision={precision:.4f}, Recall={recall:.4f}")
-
-            if num_users > 0:
-                avg_precision = total_precision / num_users
-                avg_recall = total_recall / num_users
-                avg_f1 = 2 * (avg_precision * avg_recall) / (avg_precision + avg_recall) if (avg_precision + avg_recall) > 0 else 0
-                logger.info(f"Average Precision: {avg_precision:.4f}, Recall: {avg_recall:.4f}, F1: {avg_f1:.4f}")
-                print(f"Average Precision: {avg_precision:.4f}, Recall: {avg_recall:.4f}, F1: {avg_f1:.4f}")
+            predicted_recommendations_info = []
+            if model_type == 'keyword':
+                predicted_recommendations_info = get_keyword_recommendations(user_id, top_n=k, batch_id=batch_id)
+            elif model_type == 'bpr':
+                predicted_recommendations_info = get_bpr_recommendations(user_id, top_n=k, batch_id=batch_id)
             else:
-                logger.warning("No users with sufficient data for evaluation")
-                print("No users with sufficient data for evaluation")
+                logger.error(f"Unknown model type: {model_type}")
+                return {'map': 0, 'ndcg': 0, 'hit_rate': 0}
+
+            predicted_article_ids = [article['id'] for article in predicted_recommendations_info]
+            logger.debug(f"User {user_id} - Predicted: {predicted_article_ids}")
+            logger.debug(f"User {user_id} - Actual Liked: {actual_liked_articles_ids}")
+            # logger.debug(f"User {user_id} - Intersection Liked: {set(predicted_article_ids) & set(actual_liked_articles_ids)}")
+            # logger.debug(f"User {user_id} - Actual Interacted: {actual_interacted_articles_ids[:5]}... (total {len(actual_interacted_articles_ids)})")
+
+            map_score, ndcg_score, hit_rate = calculate_extended_metrics(
+                {user_id: predicted_article_ids},
+                {user_id: actual_liked_articles_ids},
+                {user_id: actual_interacted_articles_ids},
+                k=k
+            )
+            logger.info(f"User {user_id} - {model_type} Model - MAP@{k}={map_score:.3f}, NDCG@{k}={ndcg_score:.3f}, HitRate@{k}={hit_rate:.3f}")
+            return {'map': map_score, 'ndcg': ndcg_score, 'hit_rate': hit_rate}
 
         except MySQLdb.Error as e:
-            logger.error(f"Evaluation error: {str(e)}")
-            print(f"Evaluation error: {str(e)}")
+            logger.error(f"Error evaluating {model_type} model for user {user_id}: {str(e)}", exc_info=True)
+            return {'map': 0, 'ndcg': 0, 'hit_rate': 0}
+        except Exception as e:
+            logger.error(f"Unexpected error evaluating {model_type} model for user {user_id}: {str(e)}", exc_info=True)
+            return {'map': 0, 'ndcg': 0, 'hit_rate': 0}
         finally:
+            if cur:
+                cur.close()
+            # if conn: # evaluate_recommendation_model 에서는 connection을 닫지 않음 (Flask context에서 관리)
+            #     conn.close()
+
+def evaluate_all_users(model_type='bpr', k=10):
+    logger.info(f"--- {model_type.upper()} Model Evaluation Started ---")
+    conn = None
+    cur = None
+    try:
+        conn = get_db_connection() # 이 파일의 get_db_connection 사용
+        cur = conn.cursor()
+        # 'like' 피드백을 가진 사용자만 평가 대상에 포함
+        cur.execute("SELECT DISTINCT user_id FROM user_feedback WHERE feedback_type = 'like'")
+        user_ids = [row[0] for row in cur.fetchall()]
+        logger.info(f"평가 대상 사용자 수 (liked articles 기준): {len(user_ids)}")
+
+        if not user_ids:
+            logger.warning(f"No users with 'like' feedback found for {model_type} model evaluation.")
+            return {'avg_map': 0, 'avg_ndcg': 0, 'avg_hit_rate': 0}
+
+        map_scores = []
+        ndcg_scores = []
+        hit_rates = []
+        for user_id in user_ids:
+            metrics = evaluate_recommendation_model(user_id, model_type=model_type, k=k)
+            map_scores.append(metrics['map'])
+            ndcg_scores.append(metrics['ndcg'])
+            hit_rates.append(metrics['hit_rate'])
+
+        avg_map = sum(map_scores) / len(map_scores) if map_scores else 0
+        avg_ndcg = sum(ndcg_scores) / len(ndcg_scores) if ndcg_scores else 0
+        avg_hit_rate = sum(hit_rates) / len(hit_rates) if hit_rates else 0
+        logger.info(f"--- {model_type.upper()} Model Average Results ---")
+        logger.info(f"MAP@{k}={avg_map:.4f}, NDCG@{k}={avg_ndcg:.4f}, HitRate@{k}={avg_hit_rate:.4f}")
+        print(f"--- {model_type.upper()} Model Average Results ---")
+        print(f"MAP@{k}={avg_map:.4f}, NDCG@{k}={avg_ndcg:.4f}, HitRate@{k}={avg_hit_rate:.4f}")
+
+        return {'avg_map': avg_map, 'avg_ndcg': avg_ndcg, 'avg_hit_rate': avg_hit_rate}
+
+    except Exception as e:
+        logger.error(f"전체 사용자 평가 오류 ({model_type} 모델): {str(e)}", exc_info=True)
+        return {'avg_map': 0, 'avg_ndcg': 0, 'avg_hit_rate': 0}
+    finally:
+        if cur:
             cur.close()
+        if conn:
             conn.close()
 
 if __name__ == "__main__":
-    evaluate_keyword_model()
+    with app.app_context():
+        # 키워드 모델 평가 실행
+        evaluate_all_users(model_type='keyword', k=10)
+        print("\n") # 구분선
+        # BPR 모델 평가 실행
+        evaluate_all_users(model_type='bpr', k=10)
